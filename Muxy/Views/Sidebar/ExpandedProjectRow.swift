@@ -31,6 +31,7 @@ struct ExpandedProjectRow: View {
     @State private var isRefreshingWorktrees = false
     @State private var showColorPicker = false
     @State private var showSymbolPicker = false
+    @State private var removalRequest: WorktreeRemovalRequest?
 
     private var isActive: Bool {
         appState.activeProjectID == project.id
@@ -137,6 +138,7 @@ struct ExpandedProjectRow: View {
                 onCancel: { cancelRename() }
             )
         }
+        .worktreeRemovalSheet($removalRequest)
         .popover(isPresented: $showColorPicker, arrowEdge: .trailing) {
             ProjectIconColorPicker(selectedID: project.iconColor) { id in
                 onSetIconColor(id)
@@ -420,23 +422,22 @@ struct ExpandedProjectRow: View {
     }
 
     private func performRemove(worktree: Worktree) {
-        let repoPath = project.path
         let remaining = worktrees.filter { $0.id != worktree.id }
         let replacement = remaining.first(where: { $0.id == activeWorktreeID })
             ?? remaining.first(where: { $0.isPrimary })
             ?? remaining.first
-        appState.removeWorktree(
-            projectID: project.id,
+        removalRequest = WorktreeRemovalRequest(
             worktree: worktree,
-            replacement: replacement
+            repoPath: project.path,
+            onSuccess: {
+                appState.removeWorktree(
+                    projectID: project.id,
+                    worktree: worktree,
+                    replacement: replacement
+                )
+                worktreeStore.remove(worktreeID: worktree.id, from: project.id)
+            }
         )
-        worktreeStore.remove(worktreeID: worktree.id, from: project.id)
-        Task.detached {
-            await WorktreeStore.cleanupOnDisk(
-                worktree: worktree,
-                repoPath: repoPath
-            )
-        }
     }
 
     private func startRename() {
