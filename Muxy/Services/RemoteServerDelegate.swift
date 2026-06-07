@@ -284,28 +284,9 @@ final class RemoteServerDelegate: MuxyRemoteServerDelegate {
     }
 
     private func ensureTerminalView(paneID: UUID) -> GhosttyTerminalNSView? {
-        if let view = TerminalViewRegistry.shared.existingView(for: paneID) {
-            _ = view.ensureLiveSurfaceForExternalIO()
-            return view
-        }
-        guard let location = appState.locatePane(paneID: paneID) else {
-            logger.warning("Cannot materialize pane \(paneID): no matching tab in workspace")
+        guard let view = TerminalSurfaceMaterializer.materialize(paneID: paneID, appState: appState) else {
+            logger.warning("Cannot materialize pane \(paneID): no matching tab or surface")
             return nil
-        }
-        let pane = location.pane
-        let view = TerminalViewRegistry.shared.view(
-            for: paneID,
-            workingDirectory: pane.currentWorkingDirectory ?? pane.projectPath,
-            command: pane.startupCommand,
-            commandInteractive: pane.startupCommandInteractive,
-            closesOnCommandExit: pane.closesOnStartupCommandExit
-        )
-        if view.envVars.isEmpty {
-            view.envVars = TerminalEnvVarBuilder.build(paneID: paneID, worktreeKey: location.worktreeKey)
-        }
-        view.materializeHeadless()
-        if view.surface == nil {
-            logger.warning("Headless materialization left pane \(paneID) without a surface")
         }
         return view
     }

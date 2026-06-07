@@ -362,6 +362,8 @@ final class NotificationSocketServer: @unchecked Sendable {
 
     private static let maxMessageSize = 128 * 1024
 
+    static let commandReplyTerminator: UInt8 = 0
+
     private static let stickyCommandNames: Set<String> = [
         "subscribe", "identify",
     ]
@@ -531,12 +533,13 @@ final class NotificationSocketServer: @unchecked Sendable {
     }
 
     private func processCommand(_ message: String, session: ClientSession) {
+        let isExtensionSession = session.extensionID != nil
         guard let handler = commandHandler else {
-            enqueueWrite(session: session, text: "error:no handler registered\n")
+            enqueueCommandReply(session: session, response: "error:no handler registered", isExtensionSession: isExtensionSession)
             return
         }
         guard session.inFlightCommandCount < ClientSession.maxConcurrentCommands else {
-            enqueueWrite(session: session, text: "error:too many concurrent commands\n")
+            enqueueCommandReply(session: session, response: "error:too many concurrent commands", isExtensionSession: isExtensionSession)
             return
         }
         let context = ClientContext(extensionID: session.extensionID)
@@ -546,15 +549,33 @@ final class NotificationSocketServer: @unchecked Sendable {
             let response = await handler(message, context)
             guard let self else { return }
             self.queue.async { [weak self] in
-                self?.enqueueWrite(session: session, text: response + "\n")
+                self?.enqueueCommandReply(session: session, response: response, isExtensionSession: isExtensionSession)
                 session.inFlightCommandCount -= 1
                 session.commandInFlight = session.inFlightCommandCount > 0
             }
         }
     }
 
+    private func enqueueCommandReply(session: ClientSession, response: String, isExtensionSession: Bool) {
+        enqueueData(session: session, data: Self.framedCommandReply(response: response, isExtensionSession: isExtensionSession))
+    }
+
+    static func framedCommandReply(response: String, isExtensionSession: Bool) -> Data {
+        if isExtensionSession {
+            return Data((response + "\n").utf8)
+        }
+        var data = Data(response.utf8)
+        data.append(commandReplyTerminator)
+        return data
+    }
+
     private func enqueueWrite(session: ClientSession, text: String) {
         session.writeBuffer.append(contentsOf: Data(text.utf8))
+        flushWrites(session: session)
+    }
+
+    private func enqueueData(session: ClientSession, data: Data) {
+        session.writeBuffer.append(data)
         flushWrites(session: session)
     }
 

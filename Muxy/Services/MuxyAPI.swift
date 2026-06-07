@@ -9,6 +9,7 @@ enum APIError: Error, Equatable {
     case worktreeStoreUnavailable
     case invalidPaneID
     case paneNotFound(String)
+    case paneSurfaceNotReady(paneID: String, waitedSeconds: Double)
     case projectNotFound(String)
     case worktreeNotFound(String)
     case tabNotFound(String)
@@ -29,6 +30,8 @@ enum APIError: Error, Equatable {
         case .worktreeStoreUnavailable: "worktree store unavailable"
         case .invalidPaneID: "invalid pane ID"
         case let .paneNotFound(id): "pane not found \(id)"
+        case let .paneSurfaceNotReady(id, waited):
+            "pane surface not ready \(id) (waited \(String(format: "%.1f", waited))s)"
         case let .projectNotFound(id): "project not found\(id.isEmpty ? "" : " \(id)")"
         case let .worktreeNotFound(id): "worktree not found \(id)"
         case let .tabNotFound(id): "tab not found \(id)"
@@ -436,14 +439,18 @@ enum MuxyAPI {
             {
                 return .failure(.consentDenied(verb: ExtensionGatedVerb.panesSend.rawValue))
             }
-            guard let view = await waitForView(paneID: paneID, appState: appState) else {
+            switch await waitForView(paneID: paneID, appState: appState) {
+            case let .view(view):
+                view.sendText(text)
+                return .success(())
+            case .notFound:
                 return .failure(.paneNotFound(paneIDString))
+            case let .surfaceNotReady(waited):
+                return .failure(.paneSurfaceNotReady(
+                    paneID: paneIDString,
+                    waitedSeconds: waited.secondsValue
+                ))
             }
-            guard view.ensureLiveSurfaceForExternalIO() else {
-                return .failure(.underlying("terminal surface unavailable"))
-            }
-            view.sendText(text)
-            return .success(())
         }
 
         static func sendKeys(
@@ -460,13 +467,24 @@ enum MuxyAPI {
             {
                 return .failure(.consentDenied(verb: ExtensionGatedVerb.panesSendKeys.rawValue))
             }
-            guard let view = await waitForView(paneID: paneID, appState: appState) else {
+            switch await waitForView(paneID: paneID, appState: appState) {
+            case let .view(view):
+                return Self.performSendKeys(view: view, key: key, paneIDString: paneIDString)
+            case .notFound:
                 return .failure(.paneNotFound(paneIDString))
+            case let .surfaceNotReady(waited):
+                return .failure(.paneSurfaceNotReady(
+                    paneID: paneIDString,
+                    waitedSeconds: waited.secondsValue
+                ))
             }
-            guard view.ensureLiveSurfaceForExternalIO() else {
-                return .failure(.underlying("terminal surface unavailable"))
-            }
+        }
 
+        private static func performSendKeys(
+            view: GhosttyTerminalNSView,
+            key: String,
+            paneIDString: String
+        ) -> Result<Void, APIError> {
             let bytes: Data
             switch key.lowercased() {
             case "escape",
@@ -511,13 +529,17 @@ enum MuxyAPI {
                 return .failure(.consentDenied(verb: ExtensionGatedVerb.panesReadScreen.rawValue))
             }
             let clamped = min(max(lines, 1), 500)
-            guard let view = await waitForView(paneID: paneID, appState: appState) else {
+            switch await waitForView(paneID: paneID, appState: appState) {
+            case let .view(view):
+                return .success(view.readScreenText(lastLines: clamped))
+            case .notFound:
                 return .failure(.paneNotFound(paneIDString))
+            case let .surfaceNotReady(waited):
+                return .failure(.paneSurfaceNotReady(
+                    paneID: paneIDString,
+                    waitedSeconds: waited.secondsValue
+                ))
             }
-            guard view.ensureLiveSurfaceForExternalIO() else {
-                return .failure(.underlying("terminal surface unavailable"))
-            }
-            return .success(view.readScreenText(lastLines: clamped))
         }
 
         static func close(
@@ -1020,26 +1042,57 @@ private func collectTabs(appState: AppState) -> Set<UUID> {
     return ids
 }
 
+private extension Duration {
+    var secondsValue: Double {
+        Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
+}
+
+private enum WaitForViewResult {
+    case view(GhosttyTerminalNSView)
+    case notFound
+    case surfaceNotReady(waited: Duration)
+}
+
 @MainActor
 private func waitForView(
     paneID: UUID,
     appState: AppState? = nil,
     timeout: Duration = .seconds(3)
-) async -> GhosttyTerminalNSView? {
-    if let view = TerminalViewRegistry.shared.existingView(for: paneID) {
-        return view
+) async -> WaitForViewResult {
+    let start = ContinuousClock.now
+    guard let appState else {
+        return await waitForRegisteredView(paneID: paneID, start: start, timeout: timeout)
     }
-    if let appState, locateTab(paneID: paneID, appState: appState) == nil {
-        return nil
+    guard appState.locatePane(paneID: paneID) != nil else {
+        return .notFound
     }
+    if let view = TerminalSurfaceMaterializer.materialize(paneID: paneID, appState: appState) {
+        return .view(view)
+    }
+    return .surfaceNotReady(waited: ContinuousClock.now - start)
+}
+
+@MainActor
+private func waitForRegisteredView(
+    paneID: UUID,
+    start: ContinuousClock.Instant,
+    timeout: Duration
+) async -> WaitForViewResult {
     let deadline = ContinuousClock.now + timeout
     while ContinuousClock.now < deadline {
         if let view = TerminalViewRegistry.shared.existingView(for: paneID) {
-            return view
+            return view.ensureLiveSurfaceForExternalIO()
+                ? .view(view)
+                : .surfaceNotReady(waited: ContinuousClock.now - start)
         }
-        try? await Task.sleep(for: .milliseconds(50))
+        do {
+            try await Task.sleep(for: .milliseconds(50))
+        } catch {
+            return .surfaceNotReady(waited: ContinuousClock.now - start)
+        }
     }
-    return nil
+    return .notFound
 }
 
 @MainActor
