@@ -62,10 +62,15 @@ struct SocketCommandHandlerTests {
             command: "split-down",
             parts: ["split-down", "", "   "]
         )
+        let targetedSplit = SocketCommandHandler.requiredPermissions(
+            command: "split-right",
+            parts: ["split-right", "", "", "--worktree", "feature"]
+        )
 
         #expect(plainSplit == [.panesWrite])
         #expect(commandSplit == [.panesWrite, .commandsExec])
         #expect(whitespaceCommandSplit == [.panesWrite])
+        #expect(targetedSplit == [.panesWrite])
     }
 
     @Test("split fails without active project")
@@ -325,6 +330,206 @@ struct SocketCommandHandlerTests {
 
         let tabID = try #require(UUID(uuidString: result))
         #expect(browserState(tabID: tabID, appState: appState)?.url?.absoluteString == BrowserHomePage.blankURLString)
+    }
+
+    @Test("parseTargetFlags extracts project and worktree from remaining args")
+    func parseTargetFlagsExtractsFlags() {
+        let parsed = SocketCommandHandler.parseTargetFlags(["2", "--worktree", "feature", "--project", "App"])
+        #expect(parsed.project == "App")
+        #expect(parsed.worktree == "feature")
+        #expect(parsed.remaining == ["2"])
+    }
+
+    @Test("parseTargetFlags only consumes trailing flags, preserving flag-like values")
+    func parseTargetFlagsPreservesFlagLikeValues() {
+        let parsed = SocketCommandHandler.parseTargetFlags(["https://x.com/--project/p", "--worktree", "feature"])
+        #expect(parsed.project == nil)
+        #expect(parsed.worktree == "feature")
+        #expect(parsed.remaining == ["https://x.com/--project/p"])
+    }
+
+    @Test("new-tab --worktree creates tab in target without switching active worktree")
+    func newTabTargetsWorktree() async {
+        let project = Project(name: "Test Project", path: testPath)
+        let primary = Worktree(name: project.name, path: project.path, isPrimary: true)
+        let feature = Worktree(name: "Feature", path: "/tmp/feature", branch: "feature", isPrimary: false)
+        let appState = makeAppState(projectID: project.id, worktreeID: primary.id)
+        let stores = makeStores(projects: [project], worktrees: [project.id: [primary, feature]])
+
+        let result = await SocketCommandHandler.handleRequest(
+            "new-tab|--worktree|feature",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+
+        #expect(UUID(uuidString: result) != nil)
+        #expect(appState.activeWorktreeID[project.id] == primary.id)
+        let featureKey = WorktreeKey(projectID: project.id, worktreeID: feature.id)
+        #expect(appState.areas(for: featureKey).first?.tabs.contains { $0.id.uuidString == result } == true)
+    }
+
+    @Test("list-tabs --worktree lists only the target worktree's tabs")
+    func listTabsTargetsWorktree() async {
+        let project = Project(name: "Test Project", path: testPath)
+        let primary = Worktree(name: project.name, path: project.path, isPrimary: true)
+        let feature = Worktree(name: "Feature", path: "/tmp/feature", branch: "feature", isPrimary: false)
+        let appState = makeAppState(projectID: project.id, worktreeID: primary.id)
+        let stores = makeStores(projects: [project], worktrees: [project.id: [primary, feature]])
+
+        _ = await SocketCommandHandler.handleRequest(
+            "new-tab|--worktree|feature",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+        let featureResult = await SocketCommandHandler.handleRequest(
+            "list-tabs|--worktree|feature",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+        let activeResult = await SocketCommandHandler.handleRequest("list-tabs", appState: appState)
+
+        let featureKey = WorktreeKey(projectID: project.id, worktreeID: feature.id)
+        #expect(featureResult.split(separator: "\n").count == appState.areas(for: featureKey).flatMap(\.tabs).count)
+        #expect(activeResult.split(separator: "\n").count == 1)
+    }
+
+    @Test("switch-tab --worktree selects within target without switching active worktree")
+    func switchTabTargetsWorktree() async {
+        let project = Project(name: "Test Project", path: testPath)
+        let primary = Worktree(name: project.name, path: project.path, isPrimary: true)
+        let feature = Worktree(name: "Feature", path: "/tmp/feature", branch: "feature", isPrimary: false)
+        let appState = makeAppState(projectID: project.id, worktreeID: primary.id)
+        let stores = makeStores(projects: [project], worktrees: [project.id: [primary, feature]])
+
+        _ = await SocketCommandHandler.handleRequest(
+            "new-tab|--worktree|feature",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+        let result = await SocketCommandHandler.handleRequest(
+            "switch-tab|0|--worktree|feature",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+
+        #expect(result == "ok")
+        #expect(appState.activeWorktreeID[project.id] == primary.id)
+    }
+
+    @Test("browser open --worktree creates browser tab in target without switching active worktree")
+    func browserOpenTargetsWorktree() async throws {
+        let project = Project(name: "Test Project", path: testPath)
+        let primary = Worktree(name: project.name, path: project.path, isPrimary: true)
+        let feature = Worktree(name: "Feature", path: "/tmp/feature", branch: "feature", isPrimary: false)
+        let appState = makeAppState(projectID: project.id, worktreeID: primary.id)
+        let stores = makeStores(projects: [project], worktrees: [project.id: [primary, feature]])
+
+        let result = await SocketCommandHandler.handleRequest(
+            "browser.open|https://example.com|--worktree|feature",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+
+        let tabID = try #require(UUID(uuidString: result))
+        #expect(appState.activeWorktreeID[project.id] == primary.id)
+        let featureKey = WorktreeKey(projectID: project.id, worktreeID: feature.id)
+        #expect(appState.areas(for: featureKey).first?.tabs.contains { $0.id == tabID } == true)
+    }
+
+    @Test("browser open --split --worktree opens the tab in the new split area")
+    func browserOpenSplitTargetsNewArea() async throws {
+        let project = Project(name: "Test Project", path: testPath)
+        let primary = Worktree(name: project.name, path: project.path, isPrimary: true)
+        let feature = Worktree(name: "Feature", path: "/tmp/feature", branch: "feature", isPrimary: false)
+        let appState = makeAppState(projectID: project.id, worktreeID: primary.id)
+        let stores = makeStores(projects: [project], worktrees: [project.id: [primary, feature]])
+
+        let result = await SocketCommandHandler.handleRequest(
+            "browser.open|https://example.com|--split|--worktree|feature",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+
+        let tabID = try #require(UUID(uuidString: result))
+        let featureKey = WorktreeKey(projectID: project.id, worktreeID: feature.id)
+        let areas = appState.areas(for: featureKey)
+        #expect(areas.count == 2)
+        let hostingArea = try #require(areas.first { $0.tabs.contains { $0.id == tabID } })
+        #expect(hostingArea.id == appState.focusedAreaID[featureKey])
+        #expect(hostingArea.tabs.contains { $0.content.pane != nil })
+    }
+
+    @Test("split-right --worktree splits the target worktree")
+    func splitTargetsWorktreeInsteadOfCallingPane() async throws {
+        let project = Project(name: "Test Project", path: testPath)
+        let primary = Worktree(name: project.name, path: project.path, isPrimary: true)
+        let feature = Worktree(name: "Feature", path: "/tmp/feature", branch: "feature", isPrimary: false)
+        let appState = makeAppState(projectID: project.id, worktreeID: primary.id)
+        let stores = makeStores(projects: [project], worktrees: [project.id: [primary, feature]])
+        let primaryKey = WorktreeKey(projectID: project.id, worktreeID: primary.id)
+        let primaryPaneID = try #require(appState.areas(for: primaryKey).first?.tabs.first?.content.pane?.id)
+
+        let result = await SocketCommandHandler.handleRequest(
+            "split-right|\(primaryPaneID.uuidString)||--worktree|feature",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+
+        #expect(UUID(uuidString: result) != nil)
+        #expect(appState.activeWorktreeID[project.id] == primary.id)
+        let featureKey = WorktreeKey(projectID: project.id, worktreeID: feature.id)
+        #expect(appState.areas(for: primaryKey).count == 1)
+        #expect(appState.areas(for: featureKey).count == 2)
+    }
+
+    @Test("new-tab --worktree reports unknown worktree")
+    func newTabUnknownWorktree() async {
+        let project = Project(name: "Test Project", path: testPath)
+        let primary = Worktree(name: project.name, path: project.path, isPrimary: true)
+        let appState = makeAppState(projectID: project.id, worktreeID: primary.id)
+        let stores = makeStores(projects: [project], worktrees: [project.id: [primary]])
+
+        let result = await SocketCommandHandler.handleRequest(
+            "new-tab|--worktree|missing",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+
+        #expect(result.hasPrefix("error:worktree not found"))
+    }
+
+    @Test("new-tab --project targets the project's preferred worktree")
+    func newTabTargetsProject() async {
+        let project = Project(name: "Other", path: "/tmp/other")
+        let other = Worktree(name: project.name, path: project.path, isPrimary: true)
+        let active = Project(name: "Active", path: testPath)
+        let activeWorktree = Worktree(name: active.name, path: active.path, isPrimary: true)
+        let appState = makeAppState(projectID: active.id, worktreeID: activeWorktree.id)
+        let stores = makeStores(
+            projects: [active, project],
+            worktrees: [active.id: [activeWorktree], project.id: [other]]
+        )
+
+        let result = await SocketCommandHandler.handleRequest(
+            "new-tab|--project|Other",
+            appState: appState,
+            projectStore: stores.projectStore,
+            worktreeStore: stores.worktreeStore
+        )
+
+        #expect(UUID(uuidString: result) != nil)
+        #expect(appState.activeProjectID == active.id)
+        let otherKey = WorktreeKey(projectID: project.id, worktreeID: other.id)
+        #expect(appState.areas(for: otherKey).first?.tabs.contains { $0.id.uuidString == result } == true)
     }
 
     @Test("direct tabs.open requires an identified extension")

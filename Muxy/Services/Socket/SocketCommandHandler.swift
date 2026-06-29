@@ -26,21 +26,21 @@ enum SocketCommandHandler {
 
         switch cmd {
         case "split-right":
-            let request = parseSplitRequest(parts: parts)
-            return serialize(MuxyAPI.Panes.split(
+            return handleSplit(
                 direction: .horizontal,
-                command: request.command,
-                fromPane: request.fromPane,
-                appState: appState
-            )) { $0.uuidString }
+                parts: parts,
+                appState: appState,
+                projectStore: projectStore,
+                worktreeStore: worktreeStore
+            )
         case "split-down":
-            let request = parseSplitRequest(parts: parts)
-            return serialize(MuxyAPI.Panes.split(
+            return handleSplit(
                 direction: .vertical,
-                command: request.command,
-                fromPane: request.fromPane,
-                appState: appState
-            )) { $0.uuidString }
+                parts: parts,
+                appState: appState,
+                projectStore: projectStore,
+                worktreeStore: worktreeStore
+            )
         case "send":
             guard parts.count >= 3 else { return "error:usage send|paneID|text" }
             return await serialize(
@@ -155,28 +155,59 @@ enum SocketCommandHandler {
                 "ok\t\(result.count)"
             }
         case "list-tabs":
-            return serialize(MuxyAPI.Tabs.list(appState: appState)) { tabs in
-                tabs.map { tab in
-                    "\(tab.index)\t\(tab.id.uuidString)\t\(tab.kind.rawValue)\t\(tab.title)\t\(tab.isActive)"
-                }.joined(separator: "\n")
+            let parsed = parseTargetFlags(Array(parts.dropFirst()))
+            switch resolveTarget(parsed, appState: appState, projectStore: projectStore, worktreeStore: worktreeStore) {
+            case let .failure(error):
+                return "error:\(error.message)"
+            case let .success(target):
+                return serialize(MuxyAPI.Tabs.list(appState: appState, target: target)) { tabs in
+                    tabs.map { tab in
+                        "\(tab.index)\t\(tab.id.uuidString)\t\(tab.kind.rawValue)\t\(tab.title)\t\(tab.isActive)"
+                    }.joined(separator: "\n")
+                }
             }
         case "switch-tab":
-            guard parts.count >= 2 else { return "error:usage switch-tab|index-or-id-or-title" }
-            return serialize(
-                MuxyAPI.Tabs.switchTo(
-                    identifier: parts.dropFirst().joined(separator: "|"),
-                    appState: appState
-                ),
-                ok: "ok"
-            )
+            let parsed = parseTargetFlags(Array(parts.dropFirst()))
+            guard !parsed.remaining.isEmpty else { return "error:usage switch-tab|index-or-id-or-title" }
+            switch resolveTarget(parsed, appState: appState, projectStore: projectStore, worktreeStore: worktreeStore) {
+            case let .failure(error):
+                return "error:\(error.message)"
+            case let .success(target):
+                return serialize(
+                    MuxyAPI.Tabs.switchTo(
+                        identifier: parsed.remaining.joined(separator: "|"),
+                        appState: appState,
+                        target: target
+                    ),
+                    ok: "ok"
+                )
+            }
         case "new-tab":
-            return serialize(MuxyAPI.Tabs.new(appState: appState)) { newTabID in
-                newTabID?.uuidString ?? "ok"
+            let parsed = parseTargetFlags(Array(parts.dropFirst()))
+            switch resolveTarget(parsed, appState: appState, projectStore: projectStore, worktreeStore: worktreeStore) {
+            case let .failure(error):
+                return "error:\(error.message)"
+            case let .success(target):
+                return serialize(MuxyAPI.Tabs.new(appState: appState, target: target)) { newTabID in
+                    newTabID?.uuidString ?? "ok"
+                }
             }
         case "next-tab":
-            return serialize(MuxyAPI.Tabs.next(appState: appState), ok: "ok")
+            let parsed = parseTargetFlags(Array(parts.dropFirst()))
+            switch resolveTarget(parsed, appState: appState, projectStore: projectStore, worktreeStore: worktreeStore) {
+            case let .failure(error):
+                return "error:\(error.message)"
+            case let .success(target):
+                return serialize(MuxyAPI.Tabs.next(appState: appState, target: target), ok: "ok")
+            }
         case "previous-tab":
-            return serialize(MuxyAPI.Tabs.previous(appState: appState), ok: "ok")
+            let parsed = parseTargetFlags(Array(parts.dropFirst()))
+            switch resolveTarget(parsed, appState: appState, projectStore: projectStore, worktreeStore: worktreeStore) {
+            case let .failure(error):
+                return "error:\(error.message)"
+            case let .success(target):
+                return serialize(MuxyAPI.Tabs.previous(appState: appState, target: target), ok: "ok")
+            }
         case "tab-rename":
             guard parts.count >= 2 else { return "error:usage tab-rename|<index-or-id-or-title>[|title]" }
             let title = parts.count >= 3 ? parts.dropFirst(2).joined(separator: "|") : nil
@@ -255,11 +286,19 @@ enum SocketCommandHandler {
                 )
             )
         case "browser.open":
-            let split = parts.contains("--split")
-            let urlParts = trimTrailingEmptyFields(parts.dropFirst().filter { $0 != "--split" })
+            let parsed = parseTargetFlags(Array(parts.dropFirst()))
+            let split = parsed.remaining.contains("--split")
+            let urlParts = trimTrailingEmptyFields(parsed.remaining.filter { $0 != "--split" })
             let url = urlParts.isEmpty ? nil : urlParts.joined(separator: "|")
-            return serialize(MuxyAPI.Browser.open(url: url, split: split, appState: appState)) { tabID in
-                tabID.uuidString
+            switch resolveTarget(parsed, appState: appState, projectStore: projectStore, worktreeStore: worktreeStore) {
+            case let .failure(error):
+                return "error:\(error.message)"
+            case let .success(target):
+                return serialize(
+                    MuxyAPI.Browser.open(url: url, split: split, appState: appState, target: target)
+                ) { tabID in
+                    tabID.uuidString
+                }
             }
         case "browser.navigate":
             guard parts.count >= 3 else { return "error:usage browser.navigate|<tab-id>|<url>" }
@@ -272,10 +311,20 @@ enum SocketCommandHandler {
                 ok: "ok"
             )
         case "browser.list":
-            let browserTabs = MuxyAPI.Browser.list(appState: appState, profileStore: browserProfileStore)
-            return browserTabs.map { tab in
-                "\(tab.id.uuidString)\t\(tab.title)\t\(tab.url ?? "")\t\(tab.profile)\t\(tab.isActive)"
-            }.joined(separator: "\n")
+            let parsed = parseTargetFlags(Array(parts.dropFirst()))
+            switch resolveTarget(parsed, appState: appState, projectStore: projectStore, worktreeStore: worktreeStore) {
+            case let .failure(error):
+                return "error:\(error.message)"
+            case let .success(target):
+                let browserTabs = MuxyAPI.Browser.list(
+                    appState: appState,
+                    profileStore: browserProfileStore,
+                    target: target
+                )
+                return browserTabs.map { tab in
+                    "\(tab.id.uuidString)\t\(tab.title)\t\(tab.url ?? "")\t\(tab.profile)\t\(tab.isActive)"
+                }.joined(separator: "\n")
+            }
         case "browser.read":
             guard parts.count >= 2 else { return "error:usage browser.read|<tab-id>" }
             return await serialize(MuxyAPI.Browser.read(tabIDString: parts[1], appState: appState)) { content in
@@ -759,6 +808,75 @@ enum SocketCommandHandler {
         return trimmed
     }
 
+    @MainActor
+    private static func handleSplit(
+        direction: SplitDirection,
+        parts: [String],
+        appState: AppState,
+        projectStore: ProjectStore?,
+        worktreeStore: WorktreeStore?
+    ) -> String {
+        let parsed = parseTargetFlags(Array(parts.dropFirst()))
+        switch resolveTarget(parsed, appState: appState, projectStore: projectStore, worktreeStore: worktreeStore) {
+        case let .failure(error):
+            return "error:\(error.message)"
+        case let .success(target):
+            let request = parseSplitRequest(parts: [parts[0]] + parsed.remaining)
+            return serialize(MuxyAPI.Panes.split(
+                direction: direction,
+                command: request.command,
+                fromPane: request.fromPane,
+                appState: appState,
+                target: target
+            )) { $0.uuidString }
+        }
+    }
+
+    struct ParsedTarget {
+        let project: String?
+        let worktree: String?
+        let remaining: [String]
+    }
+
+    static func parseTargetFlags(_ parts: [String]) -> ParsedTarget {
+        var project: String?
+        var worktree: String?
+        var end = parts.count
+        while end >= 2 {
+            switch parts[end - 2] {
+            case "--project":
+                project = parts[end - 1]
+            case "--worktree":
+                worktree = parts[end - 1]
+            default:
+                return ParsedTarget(project: project, worktree: worktree, remaining: Array(parts[0 ..< end]))
+            }
+            end -= 2
+        }
+        return ParsedTarget(project: project, worktree: worktree, remaining: Array(parts[0 ..< end]))
+    }
+
+    @MainActor
+    private static func resolveTarget(
+        _ parsed: ParsedTarget,
+        appState: AppState,
+        projectStore: ProjectStore?,
+        worktreeStore: WorktreeStore?
+    ) -> Result<MuxyAPI.WorktreeTarget?, APIError> {
+        let hasFlags = parsed.project?.isEmpty == false || parsed.worktree?.isEmpty == false
+        guard hasFlags else { return .success(nil) }
+        guard let projectStore, let worktreeStore else {
+            return .failure(.worktreeStoreUnavailable)
+        }
+        return MuxyAPI.resolveWorktreeTarget(
+            project: parsed.project,
+            worktree: parsed.worktree,
+            appState: appState,
+            projectStore: projectStore,
+            worktreeStore: worktreeStore
+        )
+    }
+
     static func requiredPermissions(command: String, parts: [String]) -> [ExtensionPermission] {
         if command.hasPrefix("browser."), parts.count >= 2 {
             let args = decodeJSONObject(parts[1]) ?? [:]
@@ -766,7 +884,8 @@ enum SocketCommandHandler {
         }
         var permissions = MuxyAPI.Permissions.required(for: command).map { [$0] } ?? []
         guard command == "split-right" || command == "split-down" else { return permissions }
-        let splitRequest = parseSplitRequest(parts: parts)
+        let parsed = parseTargetFlags(Array(parts.dropFirst()))
+        let splitRequest = parseSplitRequest(parts: [command] + parsed.remaining)
         let trimmedCommand = splitRequest.command?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedCommand?.isEmpty == false else { return permissions }
         permissions.append(.commandsExec)
