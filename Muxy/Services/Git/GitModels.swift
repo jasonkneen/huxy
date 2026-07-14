@@ -67,13 +67,52 @@ struct GitStatusFile: Identifiable, Hashable {
     var id: String { path }
 
     var isStaged: Bool {
-        let staged: Set<Character> = ["A", "M", "D", "R", "C"]
-        return staged.contains(xStatus)
+        switch xStatus {
+        case "A",
+             "M",
+             "D",
+             "R",
+             "C",
+             "T": true
+        default: false
+        }
     }
 
     var isUnstaged: Bool {
-        let unstaged: Set<Character> = ["M", "D", "?"]
-        return unstaged.contains(yStatus) || (xStatus == "?" && yStatus == "?")
+        switch yStatus {
+        case "A",
+             "C",
+             "D",
+             "M",
+             "R",
+             "T",
+             "U",
+             "?": true
+        default: false
+        }
+    }
+
+    var isUntracked: Bool {
+        xStatus == "?" && yStatus == "?"
+    }
+
+    var isConflicted: Bool {
+        switch (xStatus, yStatus) {
+        case ("D", "D"),
+             ("A", "U"),
+             ("U", "D"),
+             ("U", "A"),
+             ("D", "U"),
+             ("A", "A"),
+             ("U", "U"):
+            true
+        default:
+            false
+        }
+    }
+
+    var relatedPaths: [String] {
+        Array(Set([oldPath, path].compactMap(\.self))).sorted()
     }
 
     func additions(isStaged: Bool) -> Int? {

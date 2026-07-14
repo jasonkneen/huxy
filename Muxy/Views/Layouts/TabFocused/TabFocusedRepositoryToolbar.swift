@@ -9,6 +9,7 @@ struct TabFocusedRepositoryToolbar: View {
 
     @State private var repositoryState = TabFocusedRepositoryState()
     @State private var showBranchPopover = false
+    @State private var showChangesPopover = false
     @State private var showPullRequestPopover = false
     @State private var installedProviderIDs: Set<String> = []
     @State private var aiActions = RepositoryAIActionsService.shared
@@ -58,6 +59,9 @@ struct TabFocusedRepositoryToolbar: View {
                     showPullRequestPopover = false
                 }
             }
+            .onChange(of: showChangesPopover) { _, isShowing in
+                repositoryState.setChangesMonitoring(isShowing)
+            }
     }
 
     @ViewBuilder
@@ -65,6 +69,9 @@ struct TabFocusedRepositoryToolbar: View {
         if hasRepository {
             HStack(spacing: UIMetrics.spacing3) {
                 branchChip(repositoryState.summary)
+                toolbarSeparator
+                changesChip(repositoryState.summary)
+                toolbarSeparator
                 aiRepositoryAction(.commit, summary: repositoryState.summary, providerID: $commitProviderID)
                 repositoryResultContent
             }
@@ -75,10 +82,33 @@ struct TabFocusedRepositoryToolbar: View {
     @ViewBuilder
     private var repositoryResultContent: some View {
         if let summary = repositoryState.summary {
-            pullRequestActionContent(summary)
+            switch repositoryState.pullRequestState {
+            case .loading:
+                EmptyView()
+            case .noPullRequest:
+                toolbarSeparator
+                aiRepositoryAction(
+                    .createPullRequest,
+                    summary: summary,
+                    providerID: $pullRequestProviderID
+                )
+            case .unavailable:
+                toolbarSeparator
+                pullRequestUnavailableChip
+            case let .found(info):
+                toolbarSeparator
+                pullRequestChip(info)
+            }
         } else if let error = repositoryState.summaryError {
+            toolbarSeparator
             repositoryUnavailableChip(error)
         }
+    }
+
+    private var toolbarSeparator: some View {
+        Divider()
+            .overlay(MuxyTheme.border)
+            .frame(height: UIMetrics.scaled(16))
     }
 
     private func repositoryUnavailableChip(_ error: String) -> some View {
@@ -123,7 +153,6 @@ struct TabFocusedRepositoryToolbar: View {
                         .frame(maxWidth: UIMetrics.scaled(180))
                         .fixedSize(horizontal: true, vertical: false)
                     if let summary {
-                        workingTreePulse(summary)
                         upstreamTelemetry(summary.aheadBehind)
                     }
                     Image(systemName: "chevron.down")
@@ -134,7 +163,8 @@ struct TabFocusedRepositoryToolbar: View {
         )
         .disabled(
             summary == nil
-                || repositoryState.isSwitchingBranch
+                || repositoryState.isMutatingBranches
+                || repositoryState.isMutatingChanges
                 || isPerformingPullRequestAction
                 || isWorktreeRemovalInProgress
                 || hasRunningAIWorkflow
@@ -147,45 +177,104 @@ struct TabFocusedRepositoryToolbar: View {
                     summary: repositoryState.summary ?? summary,
                     branches: repositoryState.branches,
                     isLoadingBranches: repositoryState.isLoadingBranches,
-                    isRefreshing: repositoryState.isLoadingSummary || repositoryState.isLoadingBranches,
-                    isSwitching: repositoryState.isSwitchingBranch,
-                    isWorktreeRemovalInProgress: isWorktreeRemovalInProgress,
-                    isRepositoryInteractionDisabled: isPerformingPullRequestAction || hasRunningAIWorkflow,
-                    worktreeRemovalState: worktreeRemovalState,
-                    worktreeRemovalHelp: activeWorktree.map {
-                        worktreeRemovalHelp($0, state: worktreeRemovalState)
-                    },
+                    isMutatingBranches: repositoryState.isMutatingBranches,
+                    branchBeingDeleted: repositoryState.branchBeingDeleted,
+                    isRepositoryInteractionDisabled: repositoryState.isMutatingChanges
+                        || isPerformingPullRequestAction
+                        || hasRunningAIWorkflow,
                     onSwitch: { branch in
                         switchBranch(branch)
                     },
-                    onRefresh: {
-                        Task { await repositoryState.refreshRepositoryDetails() }
+                    onCreate: { branch in
+                        await repositoryState.createAndSwitchBranch(branch)
                     },
-                    onRemoveWorktree: {
-                        showBranchPopover = false
-                        guard let worktree = activeWorktree else { return }
-                        requestWorktreeRemoval(worktree)
+                    onDelete: { branch in
+                        await repositoryState.deleteBranch(branch)
                     }
                 )
             }
         }
     }
 
-    @ViewBuilder
-    private func pullRequestActionContent(_ summary: GitRepositorySummary) -> some View {
-        switch repositoryState.pullRequestState {
-        case .loading:
-            EmptyView()
-        case .noPullRequest:
-            aiRepositoryAction(
-                .createPullRequest,
-                summary: summary,
-                providerID: $pullRequestProviderID
-            )
-        case .unavailable:
-            pullRequestUnavailableChip
-        case let .found(info):
-            pullRequestChip(info)
+    private func changesChip(_ summary: GitRepositorySummary?) -> some View {
+        RepositoryToolbarChip(
+            isOpen: showChangesPopover,
+            action: {
+                showChangesPopover = true
+            },
+            content: {
+                HStack(spacing: UIMetrics.spacing2) {
+                    Circle()
+                        .fill(summary?.isDirty == true ? MuxyTheme.warning : MuxyTheme.diffAddFg)
+                        .frame(width: UIMetrics.scaled(5), height: UIMetrics.scaled(5))
+                    Text(summary.map(RepositoryChangesPresentation.chipLabel) ?? "Changes")
+                        .font(.system(size: UIMetrics.fontCaption, weight: .semibold))
+                        .foregroundStyle(summary?.isDirty == true ? MuxyTheme.warning : MuxyTheme.fgMuted)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: UIMetrics.fontMicro, weight: .bold))
+                        .foregroundStyle(MuxyTheme.fgDim)
+                }
+            }
+        )
+        .disabled(
+            summary == nil
+                || repositoryState.isMutatingBranches
+                || isPerformingPullRequestAction
+                || repositoryState.isMutatingChanges
+                || isWorktreeRemovalInProgress
+                || hasRunningAIWorkflow
+        )
+        .help(summary.map(workingTreeHelp) ?? "Loading working tree status")
+        .accessibilityLabel(summary.map(workingTreeHelp) ?? "Loading working tree status")
+        .popover(isPresented: $showChangesPopover, arrowEdge: .top) {
+            if let summary {
+                TabFocusedChangesPopover(
+                    summary: repositoryState.summary ?? summary,
+                    changes: repositoryState.changesSnapshot,
+                    untrackedLineStats: repositoryState.untrackedLineStats,
+                    untrackedLineStatsSummary: repositoryState.untrackedLineStatsSummary,
+                    hasLoadedChanges: repositoryState.hasLoadedChanges,
+                    error: repositoryState.changesError,
+                    isLoading: repositoryState.isLoadingChanges,
+                    isMutating: repositoryState.isMutatingChanges,
+                    isRepositoryInteractionDisabled: repositoryState.isMutatingBranches
+                        || isPerformingPullRequestAction
+                        || isWorktreeRemovalInProgress
+                        || hasRunningAIWorkflow,
+                    worktreeRemovalState: worktreeRemovalState,
+                    worktreeRemovalHelp: activeWorktree.map {
+                        worktreeRemovalHelp($0, state: worktreeRemovalState)
+                    },
+                    onRefresh: {
+                        await repositoryState.refreshWorkingTreeDetails()
+                    },
+                    onStage: { file in
+                        modifyChanges { await repositoryState.stage(file) }
+                    },
+                    onStageAll: {
+                        let files = repositoryState.changesSnapshot.unstagedFiles
+                        modifyChanges { await repositoryState.stage(files) }
+                    },
+                    onUnstage: { file in
+                        modifyChanges { await repositoryState.unstage(file) }
+                    },
+                    onUnstageAll: {
+                        let files = repositoryState.changesSnapshot.stagedFiles
+                        modifyChanges { await repositoryState.unstage(files) }
+                    },
+                    onDiscard: { file in
+                        modifyChanges { await repositoryState.discard(file) }
+                    },
+                    onLoadLineStats: { file in
+                        await repositoryState.loadUntrackedLineStats(for: file)
+                    },
+                    onRemoveWorktree: {
+                        showChangesPopover = false
+                        guard let worktree = activeWorktree else { return }
+                        requestWorktreeRemoval(worktree)
+                    }
+                )
+            }
         }
     }
 
@@ -203,7 +292,8 @@ struct TabFocusedRepositoryToolbar: View {
         )
         .disabled(
             repositoryState.isRefreshingPullRequest
-                || repositoryState.isSwitchingBranch
+                || repositoryState.isMutatingBranches
+                || repositoryState.isMutatingChanges
                 || isWorktreeRemovalInProgress
                 || hasRunningAIWorkflow
         )
@@ -235,7 +325,12 @@ struct TabFocusedRepositoryToolbar: View {
                 }
             }
         )
-        .disabled(repositoryState.isSwitchingBranch || isWorktreeRemovalInProgress || hasRunningAIWorkflow)
+        .disabled(
+            repositoryState.isMutatingBranches
+                || repositoryState.isMutatingChanges
+                || isWorktreeRemovalInProgress
+                || hasRunningAIWorkflow
+        )
         .help("Pull request #\(info.number) · \(PullRequestPresentation.stateLabel(for: info))")
         .accessibilityLabel("Pull request #\(info.number), \(PullRequestPresentation.stateLabel(for: info))")
         .popover(isPresented: $showPullRequestPopover, arrowEdge: .top) {
@@ -247,7 +342,8 @@ struct TabFocusedRepositoryToolbar: View {
                     isMerging: repositoryState.isMergingPullRequest,
                     isClosing: repositoryState.isClosingPullRequest,
                     isUpdatingBranch: repositoryState.isUpdatingPullRequestBranch,
-                    isWorktreeRemovalInProgress: isWorktreeRemovalInProgress,
+                    isWorktreeRemovalInProgress: isWorktreeRemovalInProgress
+                        || repositoryState.isMutatingChanges,
                     onMerge: { context, method in
                         performPullRequestAction(.merge(method), expected: context)
                     },
@@ -353,20 +449,6 @@ struct TabFocusedRepositoryToolbar: View {
         )
     }
 
-    private func workingTreePulse(_ summary: GitRepositorySummary) -> some View {
-        HStack(spacing: UIMetrics.spacing2) {
-            Circle()
-                .fill(summary.isDirty ? MuxyTheme.warning : MuxyTheme.diffAddFg)
-                .frame(width: UIMetrics.scaled(5), height: UIMetrics.scaled(5))
-            if summary.isDirty {
-                Text("\(summary.changedCount)")
-                    .font(.system(size: UIMetrics.fontXS, weight: .bold, design: .rounded))
-                    .foregroundStyle(MuxyTheme.warning)
-            }
-        }
-        .accessibilityHidden(true)
-    }
-
     @ViewBuilder
     private func upstreamTelemetry(_ status: GitRepositoryService.AheadBehind) -> some View {
         if status.ahead > 0 || status.behind > 0 {
@@ -428,6 +510,8 @@ struct TabFocusedRepositoryToolbar: View {
 
     private func switchBranch(_ branch: String) {
         guard !isWorktreeRemovalInProgress,
+              !repositoryState.isMutatingBranches,
+              !repositoryState.isMutatingChanges,
               !isPerformingPullRequestAction,
               !hasRunningAIWorkflow
         else { return }
@@ -437,7 +521,8 @@ struct TabFocusedRepositoryToolbar: View {
 
     private func updatePullRequestBranch(_ info: GitRepositoryService.PRInfo) {
         guard !isWorktreeRemovalInProgress,
-              !repositoryState.isSwitchingBranch,
+              !repositoryState.isMutatingBranches,
+              !repositoryState.isMutatingChanges,
               !isPerformingPullRequestAction,
               !hasRunningAIWorkflow
         else { return }
@@ -445,7 +530,8 @@ struct TabFocusedRepositoryToolbar: View {
     }
 
     private func requestWorktreeRemoval(_ worktree: Worktree) {
-        guard !repositoryState.isSwitchingBranch,
+        guard !repositoryState.isMutatingBranches,
+              !repositoryState.isMutatingChanges,
               !isPerformingPullRequestAction,
               !hasRunningAIWorkflow,
               let currentWorktree = activeWorktree,
@@ -480,7 +566,8 @@ struct TabFocusedRepositoryToolbar: View {
         _ action: PullRequestActionConfirmation.Kind,
         expected context: PullRequestActionConfirmation.Context
     ) {
-        guard !repositoryState.isSwitchingBranch,
+        guard !repositoryState.isMutatingBranches,
+              !repositoryState.isMutatingChanges,
               !repositoryState.isRefreshingPullRequest,
               !isWorktreeRemovalInProgress,
               !hasRunningAIWorkflow,
@@ -530,7 +617,8 @@ struct TabFocusedRepositoryToolbar: View {
     }
 
     private var isRepositoryBusy: Bool {
-        repositoryState.isSwitchingBranch
+        repositoryState.isMutatingBranches
+            || repositoryState.isMutatingChanges
             || isPerformingPullRequestAction
             || isWorktreeRemovalInProgress
     }
@@ -615,9 +703,13 @@ struct TabFocusedRepositoryToolbar: View {
     }
 
     private func branchHelp(_ summary: GitRepositorySummary) -> String {
-        let workingTree = workingTreeHelp(summary)
         let upstream = upstreamHelp(summary.aheadBehind)
-        return "\(summary.displayBranch) · \(workingTree) · \(upstream)"
+        return "\(summary.displayBranch) · \(upstream)"
+    }
+
+    private func modifyChanges(_ operation: @escaping @MainActor () async -> Void) {
+        guard !isRepositoryBusy, !hasRunningAIWorkflow else { return }
+        Task { await operation() }
     }
 
     private func workingTreeHelp(_ summary: GitRepositorySummary) -> String {
