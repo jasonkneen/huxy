@@ -22,6 +22,42 @@ struct SettingsCatalogTests {
     }
 
     @Test
+    func quickTerminalShortcutIsSearchable() {
+        let item = SettingsCatalog.matchingItems(query: "double shift").first {
+            $0.key == "shortcuts.quickTerminal"
+        }
+
+        #expect(item?.category == .shortcuts)
+        #expect(item?.section == "Quick Terminal")
+        #expect(!SettingsCatalog.jsonEditableItems.contains { $0.key == "shortcuts.quickTerminal" })
+    }
+
+    @Test
+    func quickTerminalAppearanceAndSizeAreSearchableAndJSONEditable() {
+        let quickTerminalItems = SettingsCatalog.items.filter { $0.section == "Quick Terminal" }
+
+        #expect(quickTerminalItems.contains { $0.key == QuickTerminalSizePreferences.widthKey })
+        #expect(quickTerminalItems.contains { $0.key == QuickTerminalSizePreferences.heightKey })
+        #expect(quickTerminalItems.contains { $0.key == QuickTerminalAppearancePreferences.transparencyKey })
+        #expect(quickTerminalItems.contains { $0.key == QuickTerminalAppearancePreferences.blurIntensityKey })
+        #expect(SettingsCatalog.matchingItems(query: "terminal size").contains {
+            $0.key == QuickTerminalSizePreferences.widthKey
+        })
+        #expect(SettingsCatalog.jsonEditableItems.contains {
+            $0.key == QuickTerminalSizePreferences.heightKey
+        })
+        #expect(SettingsCatalog.matchingItems(query: "glass").contains {
+            $0.key == QuickTerminalAppearancePreferences.transparencyKey
+        })
+        #expect(SettingsCatalog.jsonEditableItems.contains {
+            $0.key == QuickTerminalAppearancePreferences.blurIntensityKey
+        })
+        #expect(SettingsCatalog.matchingItems(query: "vibrancy").contains {
+            $0.key == QuickTerminalAppearancePreferences.blurIntensityKey
+        })
+    }
+
+    @Test
     func categoryMatchingUsesCatalogItems() {
         #expect(SettingsCatalog.categoryMatches(.richInput, query: "rich input"))
         #expect(!SettingsCatalog.categoryMatches(.mobile, query: "rich input"))

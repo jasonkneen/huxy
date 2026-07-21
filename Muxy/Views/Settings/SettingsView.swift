@@ -57,6 +57,10 @@ struct SettingsView: View {
         .resetsSettingsFocusOnOutsideClick()
         .onAppear {
             selectedRoute = validatedRoute(selectedRoute)
+            if SettingsFocusCoordinator.shared.consume(.quickTerminalShortcut) {
+                searchText = "Quick Terminal"
+                selectedRoute = .builtin(.shortcuts)
+            }
         }
         .onChange(of: searchText) { _, _ in
             guard !isRouteVisible(selectedRoute) else { return }
@@ -76,6 +80,11 @@ struct SettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: .focusBrowserSettings)) { _ in
             searchText = ""
             selectedRoute = .builtin(.browser)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .focusQuickTerminalShortcut)) { _ in
+            _ = SettingsFocusCoordinator.shared.consume(.quickTerminalShortcut)
+            searchText = "Quick Terminal"
+            selectedRoute = .builtin(.shortcuts)
         }
     }
 

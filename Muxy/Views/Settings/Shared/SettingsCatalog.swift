@@ -451,6 +451,50 @@ enum SettingsCatalog {
             aliases: ["keybindings", "hotkeys"]
         ),
         SettingsCatalogItem(
+            key: "shortcuts.quickTerminal",
+            title: "Quick Terminal",
+            description: "Configures the system-wide shortcut for the quick terminal.",
+            category: .shortcuts,
+            section: "Quick Terminal",
+            aliases: ["double shift", "quick terminal", "global shortcut", "hotkey"]
+        ),
+        SettingsCatalogItem(
+            key: QuickTerminalSizePreferences.widthKey,
+            title: "Quick Terminal Width",
+            description: "Sets the width of the quick terminal in points.",
+            category: .shortcuts,
+            section: "Quick Terminal",
+            defaultValue: QuickTerminalSizePreferences.defaultWidth,
+            aliases: ["size", "panel", "window"]
+        ),
+        SettingsCatalogItem(
+            key: QuickTerminalSizePreferences.heightKey,
+            title: "Quick Terminal Height",
+            description: "Sets the height of the quick terminal in points.",
+            category: .shortcuts,
+            section: "Quick Terminal",
+            defaultValue: QuickTerminalSizePreferences.defaultHeight,
+            aliases: ["size", "panel", "window"]
+        ),
+        SettingsCatalogItem(
+            key: QuickTerminalAppearancePreferences.transparencyKey,
+            title: "Quick Terminal Transparency",
+            description: "Controls how much of the desktop shows through the terminal background.",
+            category: .shortcuts,
+            section: "Quick Terminal",
+            defaultValue: QuickTerminalAppearancePreferences.defaultTransparency,
+            aliases: ["opacity", "glass", "background", "appearance"]
+        ),
+        SettingsCatalogItem(
+            key: QuickTerminalAppearancePreferences.blurIntensityKey,
+            title: "Quick Terminal Vibrancy",
+            description: "Controls the native macOS material intensity behind the terminal.",
+            category: .shortcuts,
+            section: "Quick Terminal",
+            defaultValue: QuickTerminalAppearancePreferences.defaultBlurIntensity,
+            aliases: ["blur", "glass", "frost", "background", "appearance"]
+        ),
+        SettingsCatalogItem(
             key: "shortcuts.customCommands",
             title: "Commands",
             description: "Configures shortcuts that open command tabs.",

@@ -5,6 +5,8 @@ private let settingsJSONLogger = Logger(subsystem: "app.muxy", category: "Settin
 
 @MainActor
 enum SettingsJSONStore {
+    typealias QuickTerminalShortcutUpdater = @MainActor (QuickTerminalShortcut) throws -> Void
+
     private static var defaultsObserver: NSObjectProtocol?
     private static var isApplyingSettings = false
     private static var isSyncingFile = false
@@ -23,18 +25,33 @@ enum SettingsJSONStore {
         return (try? prettifiedSettingsText(text)) ?? text
     }
 
-    static func saveUserSettingsText(_ text: String) throws {
+    static func saveUserSettingsText(
+        _ text: String,
+        quickTerminalShortcutUpdater: QuickTerminalShortcutUpdater = {
+            try QuickTerminalShortcutService.shared.updateShortcut($0)
+        }
+    ) throws {
         let data = Data(text.utf8)
         let object = try JSONSerialization.jsonObject(with: data)
         guard let dictionary = object as? [String: Any] else {
             throw SettingsJSONError.topLevelObjectRequired
         }
         let settings = try validatedSettings(from: dictionary)
-        try Data(prettyJSONString(dictionary).utf8).write(to: userSettingsURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: FilePermissions.privateFile], ofItemAtPath: userSettingsURL.path)
-        isApplyingSettings = true
-        apply(settings)
-        isApplyingSettings = false
+        let previousData = try? Data(contentsOf: userSettingsURL)
+        do {
+            try Data(prettyJSONString(dictionary).utf8).write(to: userSettingsURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: FilePermissions.privateFile],
+                ofItemAtPath: userSettingsURL.path
+            )
+            isApplyingSettings = true
+            try apply(settings, quickTerminalShortcutUpdater: quickTerminalShortcutUpdater)
+            isApplyingSettings = false
+        } catch {
+            isApplyingSettings = false
+            restoreUserSettingsFile(previousData)
+            throw error
+        }
         syncUserSettingsFileWithCurrentSettings()
     }
 
@@ -78,19 +95,26 @@ enum SettingsJSONStore {
         syncUserSettingsFileWithCurrentSettings()
     }
 
-    static func syncUserSettingsFileWithCurrentSettings() {
-        guard !isApplyingSettings, !isSyncingFile else { return }
+    @discardableResult
+    static func syncUserSettingsFileWithCurrentSettings() -> Bool {
+        guard !isApplyingSettings, !isSyncingFile else { return false }
         isSyncingFile = true
         defer { isSyncingFile = false }
         var dictionary = existingUserSettingsDictionary()
         for (key, value) in currentSettingsDictionary() {
             dictionary[key] = value
         }
+        let data = Data(prettyJSONString(dictionary).utf8)
+        if (try? Data(contentsOf: userSettingsURL)) == data {
+            return false
+        }
         do {
-            try Data(prettyJSONString(dictionary).utf8).write(to: userSettingsURL, options: .atomic)
+            try data.write(to: userSettingsURL, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: FilePermissions.privateFile], ofItemAtPath: userSettingsURL.path)
+            return true
         } catch {
             settingsJSONLogger.error("Failed to sync user settings file: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -105,6 +129,7 @@ enum SettingsJSONStore {
             return (item.key, jsonValue(value))
         })
         dictionary["shortcuts.app"] = keyBindingsJSONObject(KeyBinding.defaults)
+        dictionary["shortcuts.quickTerminal"] = codableJSONObject(QuickTerminalShortcut.default) ?? [:]
         dictionary["shortcuts.customCommands"] = commandShortcutsJSONObject(CommandShortcutConfiguration())
         dictionary["ai.providers"] = notificationProviderSettings(defaultValue: true)
         dictionary["mobile.approvedDevices"] = []
@@ -117,6 +142,7 @@ enum SettingsJSONStore {
             return (item.key, value)
         })
         dictionary["shortcuts.app"] = keyBindingsJSONObject(KeyBindingStore.shared.bindings)
+        dictionary["shortcuts.quickTerminal"] = codableJSONObject(QuickTerminalShortcutService.shared.shortcut) ?? [:]
         dictionary["shortcuts.customCommands"] = commandShortcutsJSONObject(CommandShortcutConfiguration(
             prefixCombo: CommandShortcutStore.shared.prefixCombo,
             shortcuts: CommandShortcutStore.shared.shortcuts
@@ -137,12 +163,56 @@ enum SettingsJSONStore {
             guard let item = itemsByKey[key] else { continue }
             settings[key] = try validatedValue(value, for: item)
         }
+        try validateQuickTerminalShortcutConflicts(in: settings)
         return settings
     }
 
-    private static func apply(_ dictionary: [String: Any]) {
-        for (key, value) in dictionary {
-            if applySpecialSetting(key: key, value: value) {
+    private static func validateQuickTerminalShortcutConflicts(in settings: [String: Any]) throws {
+        let shortcut: QuickTerminalShortcut = settings["shortcuts.quickTerminal"]
+            .flatMap { codableValue(from: $0) }
+            ?? QuickTerminalShortcutService.shared.shortcut
+        guard let combo = shortcut.keyCombo else { return }
+
+        let bindings = settings["shortcuts.app"].flatMap(keyBindings(from:))
+            ?? KeyBindingStore.shared.bindings
+        guard !bindings.contains(where: { $0.combo == combo }) else {
+            throw SettingsJSONError.invalidValue("shortcuts.quickTerminal")
+        }
+
+        let commandConfiguration = settings["shortcuts.customCommands"].flatMap(commandShortcutConfiguration(from:))
+            ?? CommandShortcutConfiguration(
+                prefixCombo: CommandShortcutStore.shared.prefixCombo,
+                shortcuts: CommandShortcutStore.shared.shortcuts
+            )
+        guard commandConfiguration.prefixCombo != combo,
+              !commandConfiguration.shortcuts.contains(where: { $0.combo == combo }),
+              ExtensionShortcutStore.shared.conflictingShortcut(
+                  for: combo,
+                  excludingExtensionID: nil,
+                  commandID: nil
+              ) == nil
+        else {
+            throw SettingsJSONError.invalidValue("shortcuts.quickTerminal")
+        }
+    }
+
+    private static func apply(
+        _ dictionary: [String: Any],
+        quickTerminalShortcutUpdater: QuickTerminalShortcutUpdater
+    ) throws {
+        if let quickTerminalShortcut = dictionary["shortcuts.quickTerminal"] {
+            _ = try applySpecialSetting(
+                key: "shortcuts.quickTerminal",
+                value: quickTerminalShortcut,
+                quickTerminalShortcutUpdater: quickTerminalShortcutUpdater
+            )
+        }
+        for (key, value) in dictionary where key != "shortcuts.quickTerminal" {
+            if try applySpecialSetting(
+                key: key,
+                value: value,
+                quickTerminalShortcutUpdater: quickTerminalShortcutUpdater
+            ) {
                 continue
             }
             if applyEditorSetting(key: key, value: value) {
@@ -153,6 +223,22 @@ enum SettingsJSONStore {
             } else {
                 UserDefaults.standard.set(value, forKey: key)
             }
+        }
+    }
+
+    private static func restoreUserSettingsFile(_ data: Data?) {
+        do {
+            if let data {
+                try data.write(to: userSettingsURL, options: .atomic)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: FilePermissions.privateFile],
+                    ofItemAtPath: userSettingsURL.path
+                )
+            } else if FileManager.default.fileExists(atPath: userSettingsURL.path) {
+                try FileManager.default.removeItem(at: userSettingsURL)
+            }
+        } catch {
+            settingsJSONLogger.error("Failed to restore the user settings file: \(error.localizedDescription)")
         }
     }
 
@@ -179,11 +265,11 @@ enum SettingsJSONStore {
             try validateAllowedString(string, key: item.key)
             return string
         }
-        if defaultValue is Int, let int = value as? Int {
+        if defaultValue is Int, !isBooleanValue(value), let int = value as? Int {
             try validateAllowedInt(int, key: item.key)
             return int
         }
-        if defaultValue is UInt16, let int = value as? Int {
+        if defaultValue is UInt16, !isBooleanValue(value), let int = value as? Int {
             try validateAllowedInt(int, key: item.key)
             return int
         }
@@ -234,11 +320,29 @@ enum SettingsJSONStore {
     }
 
     private static func validateAllowedInt(_ value: Int, key: String) throws {
-        if key == MobileServerService.portKey {
+        switch key {
+        case MobileServerService.portKey:
             guard let port = UInt16(exactly: value), MobileServerService.isValid(port: port) else {
                 throw SettingsJSONError.invalidValue(key)
             }
-            return
+        case QuickTerminalSizePreferences.widthKey:
+            guard QuickTerminalSizePreferences.widthRange.contains(value) else {
+                throw SettingsJSONError.invalidValue(key)
+            }
+        case QuickTerminalSizePreferences.heightKey:
+            guard QuickTerminalSizePreferences.heightRange.contains(value) else {
+                throw SettingsJSONError.invalidValue(key)
+            }
+        case QuickTerminalAppearancePreferences.transparencyKey:
+            guard QuickTerminalAppearancePreferences.transparencyRange.contains(value) else {
+                throw SettingsJSONError.invalidValue(key)
+            }
+        case QuickTerminalAppearancePreferences.blurIntensityKey:
+            guard QuickTerminalAppearancePreferences.blurIntensityRange.contains(value) else {
+                throw SettingsJSONError.invalidValue(key)
+            }
+        default:
+            break
         }
     }
 
@@ -273,6 +377,7 @@ enum SettingsJSONStore {
     private static func isSpecialJSONSetting(_ key: String) -> Bool {
         switch key {
         case "shortcuts.app",
+             "shortcuts.quickTerminal",
              "shortcuts.customCommands",
              "ai.providers",
              "mobile.approvedDevices":
@@ -286,6 +391,14 @@ enum SettingsJSONStore {
         switch key {
         case "shortcuts.app":
             guard let bindings = keyBindings(from: value), !bindings.isEmpty else { throw SettingsJSONError.invalidValue(key) }
+        case "shortcuts.quickTerminal":
+            guard let shortcut: QuickTerminalShortcut = codableValue(from: value),
+                  let canonicalShortcut = shortcut.canonicalizedForCurrentKeyboardLayout(),
+                  let canonicalValue = codableJSONObject(canonicalShortcut)
+            else {
+                throw SettingsJSONError.invalidValue(key)
+            }
+            return canonicalValue
         case "shortcuts.customCommands":
             guard let configuration = commandShortcutConfiguration(from: value), isValidKeyCombo(configuration.prefixCombo),
                   configuration.shortcuts.allSatisfy({ isValidKeyCombo($0.combo) })
@@ -302,7 +415,11 @@ enum SettingsJSONStore {
         return value
     }
 
-    private static func applySpecialSetting(key: String, value: Any) -> Bool {
+    private static func applySpecialSetting(
+        key: String,
+        value: Any,
+        quickTerminalShortcutUpdater: QuickTerminalShortcutUpdater
+    ) throws -> Bool {
         switch key {
         case SentryConsent.storageKey:
             guard let rawValue = value as? String else { return false }
@@ -330,6 +447,9 @@ enum SettingsJSONStore {
         case "shortcuts.app":
             guard let bindings = keyBindings(from: value) else { return true }
             KeyBindingStore.shared.replaceBindings(bindings)
+        case "shortcuts.quickTerminal":
+            guard let shortcut: QuickTerminalShortcut = codableValue(from: value) else { return true }
+            try quickTerminalShortcutUpdater(shortcut)
         case "shortcuts.customCommands":
             guard let configuration = commandShortcutConfiguration(from: value) else { return true }
             CommandShortcutStore.shared.replaceConfiguration(configuration)
@@ -408,9 +528,7 @@ enum SettingsJSONStore {
     }
 
     private static func isValidKeyCombo(_ combo: KeyCombo) -> Bool {
-        !combo.key.isEmpty
-            && KeyCombo.normalized(key: combo.key) == combo.key
-            && KeyCombo.normalized(modifiers: combo.modifiers) == combo.modifiers
+        combo.isAssigned && combo.isCanonical
     }
 
     private static func isValidAppKeyCombo(_ combo: KeyCombo) -> Bool {
